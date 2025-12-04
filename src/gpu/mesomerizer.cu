@@ -1,3 +1,15 @@
+// src/gpu/mesomerizer.cu
+//
+// Resonance / mesomerization normalization kernel.
+// This is *not* a full resonance enumerator, just a local
+// "smoother" that:
+//   - relaxes localized negative charge (phenoxide/enolate-like)
+//   - normalizes nitro bond orders
+//   - regularizes carboxylate C=O / C–O(−)
+//   - flattens conjugated systems toward single/double, non-aromatic.
+//
+// Layout: GAtom / GBond from gpu_structs.hpp.
+
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <stdint.h>
@@ -13,8 +25,8 @@
 __device__ __forceinline__
 bool is_conjugatable(uint8_t Z, uint8_t val, uint8_t degree) {
     // sp2 carbons, heteroatoms with lone pair, etc.
-    if (Z == 6 && val == 3) return true;
-    if ((Z == 7 || Z == 8) && val <= 2) return true;
+    if (Z == 6 && val == 3) return true;          // C(sp2)
+    if ((Z == 7 || Z == 8) && val <= 2) return true; // N/O with lone-pair-ish valence
     return false;
 }
 
@@ -40,8 +52,9 @@ __device__ __forceinline__
 bool is_carboxylate_pair(
     uint8_t Z1, uint8_t Z2,
     uint8_t val1, uint8_t val2,
-    int8_t c1, int8_t c2
-){
+    int8_t  c1,   int8_t  c2
+) {
+    // Loose C(sp2)=O / C–O(−) recognition
     return (Z1 == 6 && Z2 == 8 && val1 == 3 && val2 <= 2 && (c2 == -1 || c1 == 0));
 }
 
@@ -54,27 +67,28 @@ extern "C" __global__
 void mesomerizer_kernel(
     const GAtom *atoms,
     const GBond *bonds,
-    int8_t *outCharges,
+    int8_t  *outCharges,
     uint8_t *outBondOrder,
     uint8_t *outAromatic,
-    int numAtoms,
-    int numBonds
+    int      numAtoms,
+    int      numBonds
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // ATOM-PHASE
+    // ------------------------------------------------
+    // ATOM PHASE
     // Each thread handles an atom-level resonance shift
+    // ------------------------------------------------
     if (tid < numAtoms) {
         const GAtom A = atoms[tid];
         int8_t c = A.formalCharge;
 
-        // -----------------------------
         // 1. Phenoxide/enolate charge migration:
         //    O− or C− → move negative charge into conjugation
-        // -----------------------------
         if (can_shift_negative(A.atomicNum, c)) {
-            // Slightly relax charge to mimic delocalization
-            // (ChemAxon distributes charge across conjugated system)
+            // Slightly relax charge to mimic delocalization.
+            // This is intentionally conservative: we don't
+            // move charge across atoms, just soften it.
             int8_t adj = (abs(c) > 0 ? c / 2 : 0);
             outCharges[tid] = adj;
         } else {
@@ -84,98 +98,119 @@ void mesomerizer_kernel(
         return;
     }
 
-    // BOND-PHASE
+    // ------------------------------------------------
+    // BOND PHASE
+    // ------------------------------------------------
     int bid = tid - numAtoms;
     if (bid >= numBonds) return;
 
     const GBond B = bonds[bid];
-    const GAtom A1 = atoms[B.a1];
-    const GAtom A2 = atoms[B.a2];
 
-    uint8_t Z1 = A1.atomicNum;
-    uint8_t Z2 = A2.atomicNum;
+    // NOTE: current GBond uses idxA / idxB, not a1 / a2
+    const GAtom A1 = atoms[B.idxA];
+    const GAtom A2 = atoms[B.idxB];
 
-    int8_t c1 = A1.formalCharge;
-    int8_t c2 = A2.formalCharge;
+    const uint8_t Z1   = A1.atomicNum;
+    const uint8_t Z2   = A2.atomicNum;
 
-    uint8_t val1 = A1.valence;
-    uint8_t val2 = A2.valence;
+    const int8_t  c1   = A1.formalCharge;
+    const int8_t  c2   = A2.formalCharge;
+
+    const uint8_t val1 = A1.valence;
+    const uint8_t val2 = A2.valence;
 
     uint8_t order = B.bondOrder;
-    uint8_t arom = B.aromaticFlag;
+    uint8_t arom  = B.aromaticFlag;
+
+    // Default: no change
+    uint8_t newOrder = order;
+    uint8_t newArom  = arom;
 
     // -----------------------------
-    // 2. Nitro mesomerization
-    //    N(+)(=O)-O(-) <-> N(-)(O=O)
+    // 1. Nitro mesomerization
+    //    N(+)(=O)-O(−) ↔ N(−)(O=O) → normalize to
+    //    a reasonable N=O / N–O(−) pattern.
     // -----------------------------
     if (is_nitro_center(Z1, val1, c1) && is_nitro_oxygen(Z2, val2, c2)) {
-        // canonical nitro: N=O and N–O(-)
-        // GPU-safe simplified:
+        // canonical nitro: N=O and N–O(−)
         if (val2 == 1)
-            outBondOrder[bid] = 1;
+            newOrder = 1;  // N–O(−)
         else
-            outBondOrder[bid] = 2;
+            newOrder = 2;  // N=O
 
-        outAromatic[bid] = 0;
+        newArom = 0;
+        outBondOrder[bid] = newOrder;
+        outAromatic[bid]  = newArom;
         return;
     }
     if (is_nitro_center(Z2, val2, c2) && is_nitro_oxygen(Z1, val1, c1)) {
         if (val1 == 1)
-            outBondOrder[bid] = 1;
+            newOrder = 1;
         else
-            outBondOrder[bid] = 2;
+            newOrder = 2;
 
-        outAromatic[bid] = 0;
+        newArom = 0;
+        outBondOrder[bid] = newOrder;
+        outAromatic[bid]  = newArom;
         return;
     }
 
     // -----------------------------
-    // 3. Carboxylate resonance
+    // 2. Carboxylate resonance
     //    O− ↔ C=O flipping
     // -----------------------------
     if (is_carboxylate_pair(Z1, Z2, val1, val2, c1, c2)) {
         if (c2 == -1) {
-            outBondOrder[bid] = 1;    // C–O(-)
+            newOrder = 1;   // C–O(−)
         } else {
-            outBondOrder[bid] = 2;    // C=O
+            newOrder = 2;   // C=O
         }
-        outAromatic[bid] = 0;
+        newArom = 0;
+
+        outBondOrder[bid] = newOrder;
+        outAromatic[bid]  = newArom;
         return;
     }
     if (is_carboxylate_pair(Z2, Z1, val2, val1, c2, c1)) {
         if (c1 == -1) {
-            outBondOrder[bid] = 1;
+            newOrder = 1;
         } else {
-            outBondOrder[bid] = 2;
+            newOrder = 2;
         }
-        outAromatic[bid] = 0;
+        newArom = 0;
+
+        outBondOrder[bid] = newOrder;
+        outAromatic[bid]  = newArom;
         return;
     }
 
     // -----------------------------
-    // 4. Conjugation leveling
-    //    If both atoms conjugatable → single or double
+    // 3. Conjugation leveling
+    //    If both atoms conjugatable → push toward
+    //    a stable single/double, non-aromatic bond.
     // -----------------------------
     if (is_conjugatable(Z1, val1, A1.degree) &&
         is_conjugatable(Z2, val2, A2.degree)) {
 
-        // Keep order but remove aromatic flag if forced
-        outAromatic[bid] = 0;
+        // Remove aromatic flag in ambiguous conjugated systems
+        newArom = 0;
 
-        // soften bond: move "toward" single/double average
+        // Soften bond: move "toward" single/double average
         if (order == 1)
-            outBondOrder[bid] = 1;  // stable single
+            newOrder = 1;  // stable single
         else if (order >= 2)
-            outBondOrder[bid] = 2;  // stable double
+            newOrder = 2;  // stable double
         else
-            outBondOrder[bid] = order;
+            newOrder = order;
 
+        outBondOrder[bid] = newOrder;
+        outAromatic[bid]  = newArom;
         return;
     }
 
     // -----------------------------
-    // 5. Default: no change
+    // 4. Default: no change
     // -----------------------------
     outBondOrder[bid] = order;
-    outAromatic[bid] = arom;
+    outAromatic[bid]  = arom;
 }

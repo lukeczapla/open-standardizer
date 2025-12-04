@@ -27,11 +27,6 @@ using RDKit::ROMol;
 //
 // We'll run one block per molecule, threads over atoms.
 
-/* Bit masks (example only; align with your real encoding) */
-constexpr uint32_t FLAG_STEREO_MASK   = 0x0000000F;  // low bits store stereo
-constexpr uint32_t FLAG_EXPLICIT_H    = 0x00000010;  // explicit H marker
-
-
 __global__
 void clear_isotopes_kernel(
     int  const* __restrict__ mol_atom_offset,
@@ -227,7 +222,7 @@ static ROMol build_submol_from_keep_mask(
         auto* newBond = rw.getBondBetweenAtoms(na1, na2);
         if (newBond) {
             newBond->setIsAromatic(bond->getIsAromatic());
-            newBond->setBondStereo(bond->getBondStereo());
+            newBond->setStereo(bond->getStereo());
         }
     }
 

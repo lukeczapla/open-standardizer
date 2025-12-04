@@ -1,8 +1,9 @@
+#define PY_SSIZE_T_CLEAN
 #include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
 
 #include <stdexcept>
 #include <string>
+#define PY_SSIZE_T_CLEAN
 
 #include <RDGeneral/Exceptions.h>
 #include <GraphMol/ROMol.h>
@@ -18,12 +19,6 @@ static std::unique_ptr<RDKit::ROMol> mol_from_smiles(const std::string &s) {
     RDKit::ROMol *mol = RDKit::SmilesToMol(s);
     if (!mol) throw std::runtime_error("Invalid SMILES: " + s);
     return std::unique_ptr<RDKit::ROMol>(mol);
-}
-
-static std::unique_ptr<ROMol> mol_from_smiles(const std::string &s) {
-    RDKit::ROMol *mol = RDKit::SmilesToMol(s);
-    if (!mol) throw std::runtime_error("Invalid SMILES: " + s);
-    return std::unique_ptr<ROMol>(mol);
 }
 
 // Helper: RDKit Mol → SMILES
@@ -149,5 +144,5 @@ PYBIND11_MODULE(standardize_gpu, m) {
             "tautomerizer"
         );
         return mol_to_smiles(out);
-    })
+    });
 }

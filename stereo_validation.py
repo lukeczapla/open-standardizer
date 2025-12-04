@@ -5,6 +5,7 @@ from typing import List, Optional
 
 from rdkit import Chem
 from rdkit.Chem import rdmolops
+from rdkit.Chem.rdchem import BondStereo
 
 from .enhanced_smiles import ChemAxonMeta, enhanced_smiles_to_mol
 
@@ -18,18 +19,18 @@ except ImportError:
 @dataclass
 class AtomCIPComparison:
     atom_index: int
-    assignment: str
-    cip_code: Optional[str]
-    status: str
+    assignment: str       # ChemAxon code (e.g. "s", "r", "p")
+    cip_code: Optional[str]  # RDKit code ("R"/"S") or None
+    status: str           # "match", "mismatch", "missing_cip", "non_cip_code", ...
 
 
 @dataclass
 class BondCIPComparison:
-    atom_index1: int
-    atom_index2: int
-    assignment: str
-    cip_code: Optional[str]
-    status: str
+    atom_index1: int      # ChemAxon A index 1
+    atom_index2: int      # ChemAxon A index 2
+    assignment: str       # ChemAxon code ("e", "z", ...)
+    cip_code: Optional[str]  # RDKit code ("E"/"Z") or None
+    status: str           # "match", "mismatch", "missing_cip", "no_bond", ...
 
 
 @dataclass
@@ -63,14 +64,27 @@ def _normalize_bond_expected(code: str) -> Optional[str]:
 
 
 def _to_rdkit_index(idx: int, index_base: int) -> int:
+    # ChemAxon is 0-based in your data, so index_base=0 means "as-is"
     return idx if index_base == 0 else idx - 1
 
 
 def _assign_cip(mol: Chem.Mol) -> None:
+    # Always compute stereochemistry (atoms + bonds)
+    rdmolops.AssignStereochemistry(
+        mol, cleanIt=True, force=True, flagPossibleStereoCenters=True
+    )
+    # Then, if available, have CIPLabeler assign _CIPCode to atoms
     if HAS_CIP_LABELER:
         rdCIPLabeler.AssignCIPLabels(mol)
-    else:
-        rdmolops.AssignStereochemistry(mol, cleanIt=True, force=True)
+
+
+def _bond_stereo_to_ez(bond: Chem.Bond) -> Optional[str]:
+    st = bond.GetStereo()
+    if st == BondStereo.STEREOE:
+        return "E"
+    if st == BondStereo.STEREOZ:
+        return "Z"
+    return None
 
 
 def validate_cip_assignments_on_mol(
@@ -96,7 +110,7 @@ def validate_cip_assignments_on_mol(
 
         expected = _normalize_atom_expected(assign.config)
         if expected is None:
-            # e.g. "p": we don't know how to map this to R/S, but we keep it
+            # e.g. "p": ChemAxon code we don't map to R/S
             res.atom_non_cip_assignments.append(
                 AtomCIPComparison(assign.atom_index, assign.config, None, "non_cip_code")
             )
@@ -127,7 +141,8 @@ def validate_cip_assignments_on_mol(
         if not (0 <= rd_i1 < n_atoms and 0 <= rd_i2 < n_atoms):
             res.bond_unknown_assignments.append(
                 BondCIPComparison(
-                    bassign.atom_index1, bassign.atom_index2, bassign.config, None, "index_out_of_range"
+                    bassign.atom_index1, bassign.atom_index2,
+                    bassign.config, None, "index_out_of_range"
                 )
             )
             continue
@@ -136,7 +151,8 @@ def validate_cip_assignments_on_mol(
         if expected is None:
             res.bond_unknown_assignments.append(
                 BondCIPComparison(
-                    bassign.atom_index1, bassign.atom_index2, bassign.config, None, "unknown_expected_code"
+                    bassign.atom_index1, bassign.atom_index2,
+                    bassign.config, None, "unknown_expected_code"
                 )
             )
             continue
@@ -145,17 +161,18 @@ def validate_cip_assignments_on_mol(
         if bond is None:
             res.bond_unknown_assignments.append(
                 BondCIPComparison(
-                    bassign.atom_index1, bassign.atom_index2, bassign.config, None, "no_bond"
+                    bassign.atom_index1, bassign.atom_index2,
+                    bassign.config, None, "no_bond"
                 )
             )
             continue
 
-        if bond.HasProp("_CIPCode"):
-            cip = bond.GetProp("_CIPCode").upper()
-        else:
+        cip = _bond_stereo_to_ez(bond)
+        if cip is None:
             res.bond_missing_cip.append(
                 BondCIPComparison(
-                    bassign.atom_index1, bassign.atom_index2, bassign.config, None, "missing_cip"
+                    bassign.atom_index1, bassign.atom_index2,
+                    bassign.config, None, "missing_cip"
                 )
             )
             continue
@@ -163,13 +180,15 @@ def validate_cip_assignments_on_mol(
         if cip == expected:
             res.bond_matches.append(
                 BondCIPComparison(
-                    bassign.atom_index1, bassign.atom_index2, bassign.config, cip, "match"
+                    bassign.atom_index1, bassign.atom_index2,
+                    bassign.config, cip, "match"
                 )
             )
         else:
             res.bond_mismatches.append(
                 BondCIPComparison(
-                    bassign.atom_index1, bassign.atom_index2, bassign.config, cip, "mismatch"
+                    bassign.atom_index1, bassign.atom_index2,
+                    bassign.config, cip, "mismatch"
                 )
             )
 

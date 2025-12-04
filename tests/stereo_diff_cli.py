@@ -1,213 +1,165 @@
+#!/usr/bin/env python3
 """
-stereo_diff_cli.py
+CLI tool to compare ChemAxon-style enhanced SMILES stereo annotations
+(A/B assignments in {...}) against RDKit CIP / E,Z assignment
+after parsing.
 
-Command-line tool to compare ChemAxon-style enhanced stereo annotations
-in curly blocks (A*/B*/groups) against RDKit's CIP assignments.
+Typical input format (CSV):
 
-Input
------
-CSV with either:
-    1) id,smiles
-    2) smiles
+    id,smiles
+    123,"C[C@H](O)CC{A2=s;B1,3=e}"
+    124,"CC/C=C\Cl{B1,2=e}"
+    125,CCO{A0=r}
 
-Where `smiles` may be plain SMILES or ChemAxon-enhanced SMILES, e.g.:
+Or just:
 
-    12345,CCN(CC)CC {A7=s;A9=r;o1:7,9}
-    "C/C=C\\C {B0,1=e}"
-    CCO
-    67890,"c1ccccc1[NH2+] {A20=p;B5,6=e;&1:7;&2:20}"
+    smiles
+    "C[C@H](O)CC{A2=s}"
+    "CC/C=C\Cl{B1,2=e}"
 
-Quotes are handled by the CSV reader; commas inside SMILES are fine.
+Usage:
 
-Behavior
---------
-For each SMILES with a curly block, the tool:
-
-  - Parses the block via enhanced_smiles.py (A*, B*, o/& groups).
-  - Builds an RDKit Mol from the core SMILES.
-  - Uses stereo_validation.validate_cip_assignments_on_smiles(...)
-    to compare:
-
-      * Atom-level A<idx>=R/S vs RDKit `_CIPCode` on atoms.
-      * Bond-level B<i,j>=E/Z vs RDKit `_CIPCode` on bonds.
-
-  - Non-CIP atom codes (e.g. A20=p) are recorded but *not* treated
-    as mismatches; they are reported as "non_cip_code".
-
-The tool summarizes counts and can optionally write a detailed issues
-CSV for downstream analysis.
-
-Usage
------
-    python -m chemstandardizer.stereo_diff_cli input.csv
-    python -m chemstandardizer.stereo_diff_cli input.csv --report issues.csv
+    python -m open_standardizer.testing.stereo_diff_cli data.csv
+    cat data.csv | python -m open_standardizer.testing.stereo_diff_cli --only-failures
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-from typing import Optional
+import sys
+from typing import Iterable, Tuple, Optional
 
-from ..stereo_validation import validate_cip_assignments_on_smiles
+# Adjust this import to match your layout:
+# if testing/ is a package under open_standardizer, this is fine:
+from open_standardizer.stereo_validation import (
+    validate_cip_assignments_on_smiles,
+    StereoValidationResult,
+)
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def _iter_rows(path: Optional[str]) -> Iterable[Tuple[str, str]]:
+    """
+    Yield (record_id, enhanced_smiles) from a CSV-style input.
+
+    Rules:
+      - If the row has 1 column, we treat it as (id=smiles, smiles).
+      - If the row has >=2 columns, use (row[0], row[1]).
+      - Quotes are handled by the csv module, so commas inside SMILES are OK.
+    """
+    if path:
+        fh = open(path, "r", newline="")
+    else:
+        fh = sys.stdin
+
+    with fh:
+        reader = csv.reader(fh)
+        for row in reader:
+            if not row:
+                continue
+            if len(row) == 1:
+                smi = row[0].strip()
+                if not smi:
+                    continue
+                yield (smi, smi)
+            else:
+                rec_id = row[0].strip()
+                smi = row[1].strip()
+                if not smi:
+                    continue
+                if not rec_id:
+                    rec_id = smi
+                yield (rec_id, smi)
+
+
+def _print_result(rec_id: str, smiles: str, result: StereoValidationResult) -> None:
+    """
+    Human-readable report for a single record.
+    """
+    status = "PASS" if result.ok() else "FAIL"
+
+    print(f"{rec_id}\t{status}\t{smiles}")
+
+    # Atom-level details
+    for comp in result.atom_matches:
+        print(f"  ATOM {comp.atom_index}: {comp.assignment} == {comp.cip_code}  [match]")
+    for comp in result.atom_mismatches:
+        print(f"  ATOM {comp.atom_index}: {comp.assignment} != {comp.cip_code}  [mismatch]")
+    for comp in result.atom_missing_cip:
+        print(f"  ATOM {comp.atom_index}: {comp.assignment}  [missing RDKit CIP]")
+    for comp in result.atom_non_cip_assignments:
+        print(f"  ATOM {comp.atom_index}: {comp.assignment}  [non-CIP code / ignored]")
+
+    # Bond-level details
+    for comp in result.bond_matches:
+        print(
+            f"  BOND ({comp.atom_index1},{comp.atom_index2}): "
+            f"{comp.assignment} == {comp.cip_code}  [match]"
+        )
+    for comp in result.bond_mismatches:
+        print(
+            f"  BOND ({comp.atom_index1},{comp.atom_index2}): "
+            f"{comp.assignment} != {comp.cip_code}  [mismatch]"
+        )
+    for comp in result.bond_missing_cip:
+        print(
+            f"  BOND ({comp.atom_index1},{comp.atom_index2}): "
+            f"{comp.assignment}  [missing RDKit E/Z]"
+        )
+    for comp in result.bond_unknown_assignments:
+        print(
+            f"  BOND ({comp.atom_index1},{comp.atom_index2}): "
+            f"{comp.assignment}  [{comp.status}]"
+        )
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare ChemAxon-style enhanced stereo (A*/B* in { ... }) "
-            "against RDKit CIP assignments over a CSV of SMILES."
+            "Validate ChemAxon-style enhanced SMILES stereo annotations "
+            "against RDKit CIP/E,Z assignments."
         )
     )
     parser.add_argument(
-        "input_csv",
-        help=(
-            "Input CSV file with either 'id,smiles' or 'smiles' rows. "
-            "SMILES may include ChemAxon-style curly blocks."
-        ),
+        "input",
+        nargs="?",
+        help="Input CSV file (id,smiles). If omitted, read from stdin.",
     )
     parser.add_argument(
-        "--report",
-        metavar="PATH",
-        default=None,
+        "--only-failures",
+        action="store_true",
+        help="Only print records where at least one stereo mismatch occurs.",
+    )
+    parser.add_argument(
+        "--index-base",
+        type=int,
+        default=0,
         help=(
-            "Optional output CSV for per-record stereo issues. "
-            "If omitted, only a summary is printed."
+            "Indexing base for A/B assignments. "
+            "0 = ChemAxon 0-based (default), 1 = 1-based."
         ),
     )
 
     args = parser.parse_args(argv)
 
-    total_rows = 0
-    rows_with_meta = 0
+    any_fail = False
 
-    atom_matches = atom_mismatches = 0
-    atom_missing = atom_non_cip = 0
+    for rec_id, smi in _iter_rows(args.input):
+        vr = validate_cip_assignments_on_smiles(smi, index_base=args.index_base)
+        if vr is None:
+            # couldn't parse / no meta
+            print(f"{rec_id}\tINVALID\t{smi}")
+            continue
 
-    bond_matches = bond_mismatches = 0
-    bond_missing = bond_unknown = 0
+        if args.only_failures and vr.ok():
+            continue
 
-    report_writer = None
-    report_fh = None
+        _print_result(rec_id, smi, vr)
+        if not vr.ok():
+            any_fail = True
 
-    if args.report:
-        report_fh = open(args.report, "w", newline="")
-        report_writer = csv.writer(report_fh)
-        report_writer.writerow(
-            [
-                "id",
-                "smiles",
-                "level",        # "atom" or "bond"
-                "index1",       # atom index or first atom index
-                "index2",       # second atom index (for bonds) or empty
-                "expected",     # ChemAxon annotation (A/B code)
-                "cip",          # RDKit CIP code, if present
-                "status",       # match/mismatch/missing_cip/non_cip_code/...
-            ]
-        )
-
-    with open(args.input_csv, newline="") as fh:
-        reader = csv.reader(fh)
-
-        for line_number, row in enumerate(reader, start=1):
-            if not row:
-                continue
-            total_rows += 1
-
-            # Accept either: [smiles] OR [id,smiles,...]
-            if len(row) == 1:
-                rec_id = str(line_number)
-                smiles = row[0].strip()
-            else:
-                rec_id = row[0].strip()
-                smiles = row[1].strip()
-
-            if not smiles:
-                continue
-
-            # index_base is always 0 here: A0, B0,1, etc.
-            res = validate_cip_assignments_on_smiles(smiles, index_base=0)
-            if res is None:
-                # Either no curly metadata or parse failure; skip
-                continue
-
-            rows_with_meta += 1
-
-            # Aggregate atom stats
-            atom_matches      += len(res.atom_matches)
-            atom_mismatches   += len(res.atom_mismatches)
-            atom_missing      += len(res.atom_missing_cip)
-            atom_non_cip      += len(res.atom_non_cip_assignments)
-
-            # Aggregate bond stats
-            bond_matches      += len(res.bond_matches)
-            bond_mismatches   += len(res.bond_mismatches)
-            bond_missing      += len(res.bond_missing_cip)
-            bond_unknown      += len(res.bond_unknown_assignments)
-
-            if report_writer:
-                # Atoms: mismatches, missing CIP, and non-CIP codes
-                for a in (
-                    res.atom_mismatches
-                    + res.atom_missing_cip
-                    + res.atom_non_cip_assignments
-                ):
-                    report_writer.writerow(
-                        [
-                            rec_id,
-                            smiles,
-                            "atom",
-                            a.atom_index,
-                            "",
-                            a.assignment,
-                            a.cip_code or "",
-                            a.status,
-                        ]
-                    )
-
-                # Bonds: mismatches, missing CIP, and unknown expected codes
-                for b in (
-                    res.bond_mismatches
-                    + res.bond_missing_cip
-                    + res.bond_unknown_assignments
-                ):
-                    report_writer.writerow(
-                        [
-                            rec_id,
-                            smiles,
-                            "bond",
-                            b.atom_index1,
-                            b.atom_index2,
-                            b.assignment,
-                            b.cip_code or "",
-                            b.status,
-                        ]
-                    )
-
-    if report_fh:
-        report_fh.close()
-
-    # Summary
-    print(f"Input rows processed:        {total_rows}")
-    print(f"Rows with curly metadata:    {rows_with_meta}")
-    print()
-    print("Atom-level CIP (A<idx>=...):")
-    print(f"  matches:                   {atom_matches}")
-    print(f"  mismatches:                {atom_mismatches}")
-    print(f"  missing CIP on RDKit side: {atom_missing}")
-    print(f"  non-CIP atom codes (e.g. p): {atom_non_cip}")
-    print()
-    print("Bond-level CIP (B<i,j>=...):")
-    print(f"  matches:                   {bond_matches}")
-    print(f"  mismatches:                {bond_mismatches}")
-    print(f"  missing CIP on RDKit side: {bond_missing}")
-    print(f"  unknown/other bond codes:  {bond_unknown}")
-    if args.report:
-        print()
-        print(f"Detailed issues written to:  {args.report}")
-
-    return 0
+    return 1 if any_fail else 0
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     raise SystemExit(main())
