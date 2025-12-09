@@ -1,8 +1,9 @@
 import xml.etree.ElementTree as ET
 
 from rdkit import Chem
-from rdkit.Chem import rdMolStandardize, rdDepictor
+from rdkit.Chem import rdDepictor
 from rdkit.Chem.AllChem import EmbedMolecule
+from rdkit.Chem.MolStandardize import rdMolStandardize
 
 
 class OpenStandardizer:

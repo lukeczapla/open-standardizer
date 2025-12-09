@@ -1,6 +1,5 @@
-import os
 import socket
-
+import shutil
 
 def detect_cluster_environment() -> str:
     """

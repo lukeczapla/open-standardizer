@@ -10,7 +10,7 @@ from .gpu_cpu_policy_manager import (
     Policy,
     try_gpu_standardize,
 )
-from .cpu_ops import cpu_execute
+from .cpu_ops import cpu_execute, CPU_OPS
 from .batch_engine import BatchStandardizer
 from .stereo_export import export_curly_block_from_mol, export_enhanced_smiles_from_mol
 
@@ -19,6 +19,7 @@ from .enhanced_smiles import enhanced_smiles_to_mol, ChemAxonMeta, parse_chemaxo
 # ChemAxon-equivalent canonicalization pipeline (XML-matched)
 DEFAULT_OPS: List[str] = [
     "clear_stereo",
+    "strip_salts_default_keep_last",
     "remove_largest_fragment",
     "remove_attached_data",
     "remove_atom_values",
@@ -64,14 +65,11 @@ class Standardizer:
 
     def _apply_op(self, op_name: str, smiles: str) -> Optional[str]:
         """
-        Apply a single operation *to plain SMILES*:
+        Legacy SMILES-based single-op helper.
 
-          1. Try GPU via policy.try_gpu(op_name)
-          2. If that fails or is unavailable → CPU via cpu_execute
-
-        Returns:
-            - new SMILES string on success
-            - None on fatal failure
+        Kept for backwards-compatibility; the main code paths now use
+        a Mol-based pipeline (_apply_ops_to_mol) to avoid repeated
+        SMILES↔Mol conversions.
         """
         # 1. GPU path
         gpu_fn = self.policy.try_gpu(op_name)
@@ -80,12 +78,16 @@ class Standardizer:
             if isinstance(gpu_out, str):
                 return gpu_out
 
-        # 2. CPU fallback
+        # 2. CPU fallback: use Mol-based cpu_execute and convert back to SMILES
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
             return None
 
-        return cpu_execute(op_name, mol)  # expected to return SMILES
+        new_mol = cpu_execute(op_name, mol)
+        if new_mol is None:
+            return None
+
+        return Chem.MolToSmiles(new_mol)
 
     def standardize(self, mol: Optional[Chem.Mol]) -> Optional[Chem.Mol]:
         """
@@ -98,56 +100,92 @@ class Standardizer:
         if mol is None:
             return None
 
-        smiles = Chem.MolToSmiles(mol)
+        if not self.actions:
+            # Nothing to do, return a copy
+            return Chem.Mol(mol)
 
-        if self.actions:
-            for entry in self.actions:
-                op_name = entry["op"]
-                smiles = self._apply_op(op_name, smiles)
-                if smiles is None:
+        ops = [entry["op"] for entry in self.actions]
+        out_mol = _apply_ops_to_mol(mol, ops, self.policy)
+        return out_mol
+
+
+def _run_cpu_op_on_mol(
+    op_name: str,
+    mol: Chem.Mol,
+    policy: Policy,
+) -> Chem.Mol:
+    """
+    Run a single CPU operation on a Mol (via cpu_execute: Mol -> Mol).
+    """
+    # Always operate on a copy at the cpu_execute layer
+    new_mol = cpu_execute(op_name, mol)
+    if new_mol is None or new_mol.GetNumAtoms() == 0:
+        return mol
+    return new_mol
+
+
+def _apply_ops_to_mol(
+    mol: Chem.Mol,
+    ops: List[str],
+    policy: Policy,
+) -> Optional[Chem.Mol]:
+    """
+    Efficient Mol→Mol pipeline:
+
+      - Keeps a Mol in memory for all CPU ops.
+      - Only converts to/from SMILES when going through a GPU kernel.
+    """
+    current_mol = Chem.Mol(mol)  # work on a copy
+
+    for op_name in ops:
+        # 1) GPU attempt (works on SMILES)
+        gpu_fn = policy.try_gpu(op_name)
+        if gpu_fn is not None:
+            current_smiles = Chem.MolToSmiles(current_mol)
+            gpu_out = try_gpu_standardize(current_smiles, [op_name], policy, gpu_fn)
+            if isinstance(gpu_out, str):
+                new_mol = Chem.MolFromSmiles(gpu_out)
+                if new_mol is None:
                     return None
-
-        return Chem.MolFromSmiles(smiles)
-
-    @staticmethod
-    def standardize_many(
-        smiles_list: List[str],
-        ops: Optional[List[str]] = None,
-    ) -> List[Optional[str]]:
-        """
-        Batch standardization using DEFAULT_OPS and the global GPU/CPU manager.
-
-        INPUT:
-          - smiles_list: may be *enhanced SMILES* with ChemAxon-style tails
-                        (e.g. 'c1ccccc1[NH2+] {A7=s;A9=r;o1:7,9}')
-
-        BEHAVIOR:
-          - Strips curly metadata per input → passes core SMILES into the
-            BatchStandardizer.
-          - Re-attaches the exact same curly block to each successful output.
-        """
-        ops = ops or DEFAULT_OPS
-
-        # Parse enhanced → core for the batch
-        parsed_list = [parse_chemaxon_enhanced(s) for s in smiles_list]
-        core_list = [p.core_smiles for p in parsed_list]
-
-        engine = BatchStandardizer(GPU_CPU_MANAGER)
-        core_out_list = engine.run(core_list, ops)
-
-        results: List[Optional[str]] = []
-        for parsed, core_out in zip(parsed_list, core_out_list):
-            if core_out is None:
-                results.append(None)
+                current_mol = new_mol
                 continue
 
-            if parsed.meta:
-                # Re-attach original curly block EXACTLY as given
-                results.append(f"{core_out} {{{parsed.meta.to_raw()}}}")
-            else:
-                results.append(core_out)
+        # 2) CPU fallback (Mol-only)
+        current_mol = _run_cpu_op_on_mol(op_name, current_mol, policy)
 
-        return results
+    return current_mol
+
+
+def _apply_ops_to_smiles(
+    smiles: str,
+    ops: List[str],
+    policy: Policy,
+) -> Optional[str]:
+    """
+    Core SMILES → SMILES transformation loop.
+
+    Now implemented as:
+
+        SMILES → Mol (once) → ops on Mol → SMILES (once)
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+
+    out_mol = _apply_ops_to_mol(mol, ops, policy)
+    if out_mol is None:
+        return None
+
+    return Chem.MolToSmiles(out_mol)
+
+
+class BatchStandardizerWrapper:
+    """
+    (Optional) Wrapper if you ever want to expose a pure SMILES interface
+    around BatchStandardizer. Kept here for clarity; your existing
+    BatchStandardizer is already used by Standardizer.standardize_many.
+    """
+    pass
 
 
 def standardize_smiles(
@@ -158,15 +196,6 @@ def standardize_smiles(
     """
     Convenience wrapper: load XML, standardize a single *enhanced* SMILES
     and return SMILES.
-
-    INPUT:
-      smiles = "core_smiles {A7=s;A9=r;o1:7,9}"  (ChemAxon-style)
-             or just "core_smiles"
-
-    BEHAVIOR:
-      - Parses 'smiles' into core + curly metadata.
-      - Runs XML-driven pipeline on the *core* using Standardizer.
-      - Re-attaches the original curly block if preserve_chemaxon_meta=True.
     """
     parsed = parse_chemaxon_enhanced(smiles)
     core = parsed.core_smiles
@@ -188,40 +217,34 @@ def standardize_smiles(
     return core_out
 
 
-def _apply_ops_to_smiles(
-    smiles: str,
-    ops: List[str],
-    policy: Policy,
-) -> Optional[str]:
+def standardize_many(
+    smiles_list: List[str],
+    ops: Optional[List[str]] = None,
+) -> List[Optional[str]]:
     """
-    Core SMILES → SMILES transformation loop used by both
-    `standardize(...)` and `standardize_mol(...)`.
-
-    Takes *plain* SMILES (no curly metadata) and a list of ops.
+    Batch standardization using DEFAULT_OPS and the global GPU/CPU manager.
     """
-    current = smiles
+    ops = ops or DEFAULT_OPS
 
-    for op_name in ops:
-        # 1) GPU attempt
-        gpu_fn = policy.try_gpu(op_name)
-        if gpu_fn is not None:
-            gpu_out = try_gpu_standardize(current, [op_name], policy, gpu_fn)
-            if isinstance(gpu_out, str):
-                current = gpu_out
-                continue
+    # Parse enhanced → core for the batch
+    parsed_list = [parse_chemaxon_enhanced(s) for s in smiles_list]
+    core_list = [p.core_smiles for p in parsed_list]
 
-        # 2) CPU fallback
-        mol = Chem.MolFromSmiles(current)
-        if mol is None:
-            return None
+    engine = BatchStandardizer(GPU_CPU_MANAGER)
+    core_out_list = engine.run(core_list, ops)
 
-        # policy.cpu_ops is expected to return a SMILES string
-        current = policy.cpu_ops(op_name, mol)
-        if not isinstance(current, str):
-            return None
+    results: List[Optional[str]] = []
+    for parsed, core_out in zip(parsed_list, core_out_list):
+        if core_out is None:
+            results.append(None)
+            continue
 
-    return current
+        if parsed.meta:
+            results.append(f"{core_out} {{{parsed.meta.to_raw()}}}")
+        else:
+            results.append(core_out)
 
+    return results
 
 
 def standardize(
@@ -233,49 +256,19 @@ def standardize(
     index_base: int = 0,
 ) -> Optional[str]:
     """
-    Functional API (no XML), *enhanced SMILES aware*:
-
-      - Takes an enhanced SMILES string like:
-          "c1ccccc1[NH2+] {A7=s;A9=r;o1:7,9}"
-
-      - Uses enhanced_smiles_to_mol(...) to:
-          * parse curly metadata
-          * construct Mol
-          * apply ChemAxon StereoGroups + atom assignments
-
-      - Converts Mol to core SMILES for per-op GPU/CPU pipeline
-      - At the end:
-          * if regenerate_chemaxon_meta=True:
-              - rebuilds a curly block from RDKit (CIP + groups)
-          * elif preserve_chemaxon_meta=True and original meta exists:
-              - reattaches the original curly block verbatim
-          * else:
-              - returns plain SMILES
+    Functional API (no XML), *enhanced SMILES aware*.
     """
     mol, meta = enhanced_smiles_to_mol(smiles, index_base=index_base)
     if mol is None:
         return None
 
-    current = Chem.MolToSmiles(mol)
+    out_mol = _apply_ops_to_mol(mol, ops, policy)
+    if out_mol is None:
+        return None
 
-    for op_name in ops:
-        gpu_fn = policy.try_gpu(op_name)
-        if gpu_fn is not None:
-            gpu_out = try_gpu_standardize(current, [op_name], policy, gpu_fn)
-            if isinstance(gpu_out, str):
-                current = gpu_out
-                continue
-
-        mol = Chem.MolFromSmiles(current)
-        if mol is None:
-            return None
-
-        current = policy.cpu_ops(op_name, mol)
+    current = Chem.MolToSmiles(out_mol)
 
     if regenerate_chemaxon_meta:
-        out_mol = Chem.MolFromSmiles(current)
-        if out_mol is None:
-            return None
         new_block = export_curly_block_from_mol(
             out_mol, existing_meta=meta, index_base=index_base
         )
@@ -295,29 +288,13 @@ def standardize_mol(
     policy: Policy = GPU_CPU_MANAGER,
 ) -> Optional[Chem.Mol]:
     """
-    Functional Mol→Mol API (no XML, no ChemAxon curly metadata):
-
-      - Takes an RDKit Mol.
-      - Runs the same op sequence as `standardize(...)` (DEFAULT_OPS by default).
-      - Uses GPU first (per op) via `policy.try_gpu`, then falls back to
-        `policy.cpu_ops(op_name, mol)` on failure.
-      - Returns a *new* Mol (no in-place mutation is guaranteed).
-
-    This is essentially the Mol-level equivalent of:
-
-        standardize(smiles, ops=..., policy=...)
-
-    but without any enhanced SMILES parsing or curly-block handling.
+    Functional Mol→Mol API (no XML, no ChemAxon curly metadata).
     """
     if mol is None:
         return None
 
-    core_smiles = Chem.MolToSmiles(mol)
-    core_out = _apply_ops_to_smiles(core_smiles, ops, policy)
-    if core_out is None:
-        return None
-
-    return Chem.MolFromSmiles(core_out)
+    out_mol = _apply_ops_to_mol(mol, ops, policy)
+    return out_mol
 
 
 def standardize_mol_xml(
@@ -339,14 +316,8 @@ def standardize_molblock(
     v3000: bool = False,
 ) -> Optional[str]:
     """
-    Standardize a molfile (MolBlock string) and return either:
-
-      - a new MolBlock (default), or
-      - a canonical SMILES.
-
-    Notes:
-      - This does *not* handle ChemAxon enhanced SMILES curly metadata;
-        it just uses the structure in the molfile.
+    Standardize a molfile (MolBlock string) and return either
+    a new MolBlock (default) or a canonical SMILES.
     """
     if not molblock.strip():
         return None
@@ -374,17 +345,6 @@ def standardize_enhanced_smiles_to_molblock(
 ) -> Optional[str]:
     """
     Enhanced SMILES → standardized molfile.
-
-    - Uses enhanced_smiles_to_mol to apply ChemAxon-style metadata
-      to the RDKit Mol (StereoGroups, A/B assignments).
-    - Runs the same op list as `standardize(...)`.
-    - Returns a MolBlock string (V2000 by default, V3000 if requested).
-
-    NOTE:
-      The curly metadata itself isn’t re-encoded into the molfile; the
-      info that is mapped to RDKit’s stereochemistry will be reflected
-      in the structure (stereo wedges, bond stereo, groups), the rest
-      stays in atom/bond props on the Mol object.
     """
     mol, _meta = enhanced_smiles_to_mol(smiles, index_base=index_base)
     if mol is None:
@@ -399,6 +359,7 @@ def standardize_enhanced_smiles_to_molblock(
 
 MoleculeLike = Union[str, Chem.Mol]
 
+
 def standardize_any(
     x: MoleculeLike,
     ops: List[str] = DEFAULT_OPS,
@@ -408,19 +369,9 @@ def standardize_any(
     output_format: str = "smiles",  # "smiles", "mol", "molblock"
 ) -> Optional[Union[str, Chem.Mol]]:
     """
-    Convenience front door:
-
-      - If x is Chem.Mol → standardize_mol.
-      - If x is a string with 'M  END' or multiple lines → treat as MolBlock.
-      - Else:
-          - if assume_enhanced_smiles=True or contains '{...}' → enhanced SMILES.
-          - otherwise → plain SMILES.
-
-      output_format:
-        - "smiles"   → return SMILES
-        - "mol"      → return Chem.Mol
-        - "molblock" → return molfile string
+    Convenience front door.
     """
+    # 1) Already a Mol
     if isinstance(x, Chem.Mol):
         out_mol = standardize_mol(x, ops=ops, policy=policy)
         if out_mol is None:
@@ -431,7 +382,7 @@ def standardize_any(
             return Chem.MolToMolBlock(out_mol)
         return Chem.MolToSmiles(out_mol)
 
-    # x is a string
+    # 2) String input
     s = x.strip()
     if not s:
         return None
@@ -450,7 +401,7 @@ def standardize_any(
             return Chem.MolToMolBlock(out_mol)
         return Chem.MolToSmiles(out_mol)
 
-    # SMILES / enhanced SMILES
+    # 3) SMILES / enhanced SMILES
     is_enhanced = assume_enhanced_smiles or ("{" in s and "}" in s)
     if is_enhanced:
         out = standardize(
@@ -475,21 +426,22 @@ def standardize_any(
             return Chem.MolToMolBlock(mol)
         return out
 
-    # plain SMILES
-    core_out = _apply_ops_to_smiles(s, ops, policy)
-    if core_out is None:
+    # 4) plain SMILES (no curly block)
+    mol = Chem.MolFromSmiles(s)
+    if mol is None:
+        return None
+
+    out_mol = standardize_mol(mol, ops=ops, policy=policy)
+    if out_mol is None:
         return None
 
     if output_format == "smiles":
-        return core_out
-    mol = Chem.MolFromSmiles(core_out)
-    if mol is None:
-        return None
+        return Chem.MolToSmiles(out_mol)
     if output_format == "mol":
-        return mol
+        return out_mol
     if output_format == "molblock":
-        return Chem.MolToMolBlock(mol)
-    return core_out
+        return Chem.MolToMolBlock(out_mol)
+    return Chem.MolToSmiles(out_mol)
 
 
 def standardize_mol_to_enhanced_smiles(
@@ -502,12 +454,6 @@ def standardize_mol_to_enhanced_smiles(
 ) -> Optional[str]:
     """
     Mol → standardized Mol → ChemAxon-style enhanced SMILES.
-
-    - Runs the same op list as `standardize_mol`.
-    - Then encodes A/B/group tokens from the *result*.
-    - If existing_meta is provided:
-        * mode="append": keep original non-stereo tokens; add fresh A/B/group.
-        * mode="replace": drop old stereo tokens; keep non-stereo; add fresh ones.
     """
     if mol is None:
         return None
@@ -533,15 +479,6 @@ def standardize_to_enhanced_smiles(
 ) -> Optional[str]:
     """
     Enhanced SMILES (or plain SMILES) → standardized enhanced SMILES.
-
-    - If input has a { ... } block:
-        * parse ChemAxon meta via enhanced_smiles_to_mol
-        * apply XML-free op list on the core
-        * re-encode stereo/meta using export_enhanced_smiles_from_mol,
-          optionally merging with original non-stereo tokens.
-
-    - If input is plain SMILES:
-        * treat it as no existing_meta and just encode fresh tokens.
     """
     mol, meta = enhanced_smiles_to_mol(smiles, index_base=index_base)
     if mol is None:
@@ -551,7 +488,6 @@ def standardize_to_enhanced_smiles(
     if out_mol is None:
         return None
 
-    # meta contains the original block (if any); pass it if you want merge behavior.
     return export_enhanced_smiles_from_mol(
         out_mol,
         existing_meta=meta,

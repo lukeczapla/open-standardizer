@@ -7,7 +7,6 @@ Drop-in replacement for:
 import os
 import xml.etree.ElementTree as ET
 from rdkit import Chem
-from rdkit.Chem import rdMolStandardize
 from rdkit.Chem.MolStandardize import rdMolStandardize as molvs
 
 

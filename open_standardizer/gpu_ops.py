@@ -1,9 +1,13 @@
 # molvs_standardizer/gpu_ops.py
 
+import os
 from typing import Callable, List, Dict
-from .gpu_cpu_policy_manager import Policy
-from .gpu_cpu_policy_manager import try_gpu_standardize  # if you have this helper
-from .gpu.standardize_gpu import gpu_standardize
+
+USE_GPU = os.getenv("OPEN_STANDARDIZER_ENABLE_CUDA", "0").lower() in ["1", "true", "yes"]
+
+if USE_GPU:
+    from .gpu.standardize_gpu import gpu_standardize
+
 
 GPU_OPS: Dict[str, Callable[[str, List[str]], str]] = {}
 
@@ -19,7 +23,7 @@ GPU_OPS.update(
         "clear_isotopes":              _single_step("clear_isotopes"),   # if you register it
         "clear_stereo":                _single_step("stereo"),
         "bond_order":                  _single_step("bond_order"),
-        "charge":                      _single_step["charge_normalize"],
+        "charge":                      _single_step("charge_normalize"),
         "remove_largest_fragment":     _single_step("keep_largest_fragment"),
         "remove_fragment_keeplargest": _single_step("keep_largest_fragment"),
         "remove_explicit_h":           _single_step("remove_explicit_h"),
@@ -43,7 +47,7 @@ def _make_single_step_gpu(step_name: str) -> Callable[[str, List[str]], str]:
     return _fn
 
 
-def register_gpu_ops(policy: Policy) -> None:
+def register_gpu_ops(policy) -> None:
     """
     Populate policy.gpu_ops with per-operation GPU handlers.
     Op names here must match whatever your CPU ops / XML mapping uses.
@@ -85,3 +89,5 @@ def register_gpu_ops(policy: Policy) -> None:
         policy.cpu_only_ops.update({
             # If there are ops you explicitly never want on GPU:
         })
+
+

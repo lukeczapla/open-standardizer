@@ -13,6 +13,8 @@ ACTION_MAP = {
     "RemoveAtomValues": "remove_atom_values",
     "RemoveExplicitH": "remove_explicit_h",
     "ClearIsotopes": "clear_isotopes",
+    "ClearAtomValues": "clear_atom_values",
+    "CleanGeometry": "clean_geometry",
     "Neutralize": "neutralize",
     "Mesomerize": "mesomerize",
     "Tautomerize": "tautomerize",

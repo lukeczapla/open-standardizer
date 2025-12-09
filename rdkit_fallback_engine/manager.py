@@ -1,6 +1,6 @@
 import rdkit
 from rdkit import Chem
-from rdkit.Chem import rdMolStandardize
+from rdkit.Chem.MolStandardize import rdMolStandardize
 
 from ..gpu.standardizer import gpu_standardize_once
 

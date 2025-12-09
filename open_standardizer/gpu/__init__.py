@@ -2,7 +2,7 @@
 Auto-register GPU kernels if pybind11 / CUDA modules are importable.
 """
 
-from .standardize_gpu import register_gpu_kernel
+from ..gpu_ops import register_gpu_kernel
 
 try:
     # These come from pybind11-wrapped CUDA objects

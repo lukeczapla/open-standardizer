@@ -1,7 +1,7 @@
 
 # RDKit CPU fallback module (trimmed scaffold)
 from rdkit import Chem
-from rdkit.Chem import rdMolStandardize
+from rdkit.Chem.MolStandardize import rdMolStandardize
 
 def cpu_standardize(smiles: str) -> str:
     mol = Chem.MolFromSmiles(smiles)

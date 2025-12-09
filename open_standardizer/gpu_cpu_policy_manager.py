@@ -1,6 +1,7 @@
-import time
+import time, os
 from collections import deque
 from rdkit import Chem
+from typing import Mapping, Callable, Any
 
 from .gpu_ops import GPU_OPS
 from .cpu_ops import cpu_execute
@@ -8,6 +9,12 @@ from .gpu_exceptions import GPUNotAvailable, GPUStepFailed
 from open_standardizer.cluster_env import detect_cluster_environment, get_policy_overrides
 from .gpu_cpu_profiler import GPUCPUProfiler
 
+USE_GPU = os.getenv("OPEN_STANDARDIZER_ENABLE_CUDA", "0") == "1"
+if USE_GPU:
+    from .gpu_ops import GPU_OPS
+else:
+    # CPU-only mode: no GPU kernels
+    GPU_OPS: Mapping[str, Callable[..., Any]] = {}
 
 class Policy:
     """
@@ -185,21 +192,6 @@ def try_gpu_standardize(smiles: str, pipeline, policy: Policy, gpu_fn):
 # ====================================================================================
 # GLOBAL INSTANCE (this is what `standardize.py` uses)
 # ====================================================================================
-
-"""
-GPUCPUPolicyManager = Policy(
-    enable_gpu=True,
-    max_gpu_fail_rate=0.25,
-    window_size=100,
-    allow_large_molecules=True,
-    max_atoms_gpu=200,
-    min_atoms_gpu=5,
-    prefer_gpu=True,
-    # wire these to XML-ops / defaults if you want:
-    gpu_required_ops=set(),   # e.g. {"clear_stereo", "aromatize", "mesomerize"}
-    cpu_only_ops=set(),       # e.g. {"remove_largest_fragment", "remove_explicit_h"}
-)
-"""
 
 GPU_CPU_MANAGER = Policy(
     enable_gpu=True,

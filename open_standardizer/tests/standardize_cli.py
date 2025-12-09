@@ -46,22 +46,31 @@ import csv
 import sys
 from typing import Iterable, Optional, Tuple, List
 
-from rdkit import Chem
+from rdkit import Chem  # kept in case you want to extend later
 
 from open_standardizer.standardize import (
-    Standardizer,
     standardize,
     standardize_smiles,
-    standardize_mol,
+    standardize_any,
     DEFAULT_OPS,
 )
 from open_standardizer.gpu_cpu_policy_manager import GPU_CPU_MANAGER, Policy
-from open_standardizer.enhanced_smiles import parse_chemaxon_enhanced
 
 
 # ---------------------------------------------------------------------------
 # CSV helpers
 # ---------------------------------------------------------------------------
+
+def _core_smiles(s: str) -> str:
+    """
+    Strip ChemAxon-style curly metadata for display only.
+
+    Example:
+      'CCC[NH3+] {A7=s;B1,3=e}' -> 'CCC[NH3+]'
+      'CCO'                      -> 'CCO'
+    """
+    return s.split(" {", 1)[0]
+
 
 def _iter_rows(path: Optional[str]) -> Iterable[Tuple[str, str]]:
     """
@@ -85,12 +94,10 @@ def _iter_rows(path: Optional[str]) -> Iterable[Tuple[str, str]]:
             if not row:
                 continue
 
-            # Optional: if first row looks like a header with "smiles" in it,
-            # just skip it. This is heuristic but convenient.
+            # Heuristic header skip if "smiles" appears
             if not header_peeked:
                 header_peeked = True
                 if any(col.lower() == "smiles" for col in row):
-                    # treat as header, skip
                     continue
 
             if len(row) == 1:
@@ -118,8 +125,8 @@ def _standardize_with_xml(
     preserve_chemaxon_meta: bool,
 ) -> Optional[str]:
     """
-    XML-driven pipeline. Uses Standardizer.standardize() via standardize_smiles,
-    which is already enhanced-SMILES-aware.
+    XML-driven pipeline. Uses standardize_smiles, which is already
+    enhanced-SMILES-aware and runs through Standardizer.standardize().
     """
     return standardize_smiles(
         smiles=smiles,
@@ -137,9 +144,24 @@ def _standardize_with_ops(
     index_base: int,
 ) -> Optional[str]:
     """
-    DEFAULT_OPS / custom ops pipeline, enhanced-SMILES-aware, using the
-    `standardize(...)` helper (string-in/string-out).
+    DEFAULT_OPS / custom ops pipeline, enhanced-SMILES-aware.
+
+    Uses the Mol-based pipeline underneath via standardize_any, so we
+    only do SMILES→Mol once and Mol→SMILES once.
     """
+    # If we are dropping all metadata, we can just ask for plain SMILES.
+    if not preserve_chemaxon_meta and not regenerate_chemaxon_meta:
+        return standardize_any(
+            smiles,
+            ops=ops,
+            policy=policy,
+            assume_enhanced_smiles=True,
+            index_base=index_base,
+            output_format="smiles",
+        )
+
+    # If we want to preserve or regenerate ChemAxon meta, use the high-level
+    # enhanced-SMILES helper.
     return standardize(
         smiles=smiles,
         ops=ops,
@@ -181,7 +203,6 @@ def _process_smiles(
                 preserve_chemaxon_meta=preserve_meta,
             )
         else:
-            # Ops list
             ops = args.ops or list(DEFAULT_OPS)
             out = _standardize_with_ops(
                 smiles=smiles,
@@ -196,8 +217,7 @@ def _process_smiles(
             return orig, "ERROR"
         return out, "OK"
 
-    except Exception as e:  # pragma: no cover - CLI defensive layer
-        # Keep it simple: propagate original SMILES, mark as error
+    except Exception as e:  # CLI defensive layer
         sys.stderr.write(f"[ERROR] {e!r} while processing: {orig}\n")
         return orig, "ERROR"
 
@@ -284,7 +304,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.only_errors and status == "OK":
             continue
 
-        writer.writerow([rec_id, smi, std_smi, status])
+        orig_core = _core_smiles(smi)
+        std_core = _core_smiles(std_smi)
+
+        writer.writerow([rec_id, orig_core, std_core, status])
         if status != "OK":
             any_error = True
 
