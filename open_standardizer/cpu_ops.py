@@ -9,8 +9,8 @@ _STRIPPER_DEFAULT_KEEP_LAST = rdMolStandardize.FragmentRemover()
 
 # ---- Tautomer enumerator with higher limits ----
 _TAUTOMER_PARAMS = CleanupParameters()
-_TAUTOMER_PARAMS.maxTautomers = 96
-_TAUTOMER_PARAMS.maxTransforms = 256
+_TAUTOMER_PARAMS.maxTautomers = 128
+_TAUTOMER_PARAMS.maxTransforms = 512
 
 _TAUTOMER_ENUMERATOR = TautomerEnumerator(_TAUTOMER_PARAMS)
 _UNCHARGER = rdMolStandardize.Uncharger()
@@ -44,10 +44,10 @@ def _safe_sanitize(mol: Chem.Mol) -> Tuple[Chem.Mol, bool]:
 def _ensure_mol(mol):
     """
     Accept either RDKit Mol or SMILES string.
-    Always return a *copy* of a Mol or None on failure.
+    Always return a Mol or None on failure.
     """
     if isinstance(mol, Chem.Mol):
-        return Chem.Mol(mol)
+        return mol
     if isinstance(mol, str):
         s = mol.strip()
         if not s:
@@ -76,6 +76,7 @@ def _strip_with_remover(remover, mol, allow_empty: bool):
         return out
     except Exception:
         return mol
+
 
 # ---------- 1. CLEAR STEREO ----------
 def op_clear_stereo(mol):
@@ -415,7 +416,6 @@ def cpu_execute(op_name, mol):
     # Normalize input → work_mol is always a Chem.Mol or None
     if isinstance(mol, Chem.Mol):
         work_mol = Chem.Mol(mol)  # copy
-        orig_smiles = Chem.MolToSmiles(mol)
     else:
         # caller passed a SMILES string
         orig_smiles = str(mol)

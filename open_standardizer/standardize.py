@@ -11,6 +11,7 @@ from .gpu_cpu_policy_manager import (
     try_gpu_standardize,
 )
 from .cpu_ops import cpu_execute, CPU_OPS
+from .chemaxon_canonical import chemaxon_like_smiles_from_mol
 from .batch_engine import BatchStandardizer
 from .stereo_export import export_curly_block_from_mol, export_enhanced_smiles_from_mol
 
@@ -63,7 +64,7 @@ class Standardizer:
         self.xml_config_path = xml_path
         self.actions = load_xml_actions(xml_path)
 
-    def _apply_op(self, op_name: str, smiles: str) -> Optional[str]:
+    def _apply_op(self, op_name: str, smiles: str, canonical_mode = "rdkit") -> Optional[str]:
         """
         Legacy SMILES-based single-op helper.
 
@@ -87,7 +88,12 @@ class Standardizer:
         if new_mol is None:
             return None
 
-        return Chem.MolToSmiles(new_mol)
+        if canonical_mode == "chemaxon-like":
+            return chemaxon_like_smiles_from_mol(new_mol)
+        elif canonical_mode == "none":
+            return Chem.MolToSmiles(new_mol, canonical=False)
+        else:  # "rdkit"
+            return Chem.MolToSmiles(new_mol, canonical=True)
 
     def standardize(self, mol: Optional[Chem.Mol]) -> Optional[Chem.Mol]:
         """
@@ -160,6 +166,7 @@ def _apply_ops_to_smiles(
     smiles: str,
     ops: List[str],
     policy: Policy,
+    canonical_mode: str = "rdkit"
 ) -> Optional[str]:
     """
     Core SMILES → SMILES transformation loop.
@@ -176,7 +183,12 @@ def _apply_ops_to_smiles(
     if out_mol is None:
         return None
 
-    return Chem.MolToSmiles(out_mol)
+    if canonical_mode == "chemaxon-like":
+        return chemaxon_like_smiles_from_mol(out_mol)
+    elif canonical_mode == "none":
+        return Chem.MolToSmiles(out_mol, canonical=False)
+    else:  # "rdkit"
+        return Chem.MolToSmiles(out_mol, canonical=True)
 
 
 class BatchStandardizerWrapper:
@@ -192,6 +204,7 @@ def standardize_smiles(
     smiles: str,
     xml_path: str,
     preserve_chemaxon_meta: bool = True,
+    canonical_mode: str = "rdkit"
 ) -> Optional[str]:
     """
     Convenience wrapper: load XML, standardize a single *enhanced* SMILES
@@ -209,7 +222,12 @@ def standardize_smiles(
     if out_mol is None:
         return None
 
-    core_out = Chem.MolToSmiles(out_mol)
+    if canonical_mode == "chemaxon-like":
+        core_out = chemaxon_like_smiles_from_mol(out_mol)
+    elif canonical_mode == "none":
+        core_out = Chem.MolToSmiles(out_mol, canonical=False)
+    else:  # "rdkit"
+        core_out = Chem.MolToSmiles(out_mol, canonical=True)
 
     if preserve_chemaxon_meta and parsed.meta:
         return f"{core_out} {{{parsed.meta.to_raw()}}}"
@@ -254,6 +272,7 @@ def standardize(
     preserve_chemaxon_meta: bool = True,
     regenerate_chemaxon_meta: bool = False,
     index_base: int = 0,
+    canonical_mode: str = "rdkit"
 ) -> Optional[str]:
     """
     Functional API (no XML), *enhanced SMILES aware*.
@@ -266,7 +285,12 @@ def standardize(
     if out_mol is None:
         return None
 
-    current = Chem.MolToSmiles(out_mol)
+    if canonical_mode == "chemaxon-like":
+        current = chemaxon_like_smiles_from_mol(out_mol)
+    elif canonical_mode == "none":
+        current = Chem.MolToSmiles(out_mol, canonical=False)
+    else:  # "rdkit"
+        current = Chem.MolToSmiles(out_mol)
 
     if regenerate_chemaxon_meta:
         new_block = export_curly_block_from_mol(
@@ -314,6 +338,7 @@ def standardize_molblock(
     policy: Policy = GPU_CPU_MANAGER,
     return_molblock: bool = True,
     v3000: bool = False,
+    canonical_mode: str = "rdkit"
 ) -> Optional[str]:
     """
     Standardize a molfile (MolBlock string) and return either
@@ -332,8 +357,13 @@ def standardize_molblock(
 
     if return_molblock:
         return Chem.MolToMolBlock(out_mol, forceV3000=v3000)
-
-    return Chem.MolToSmiles(out_mol)
+    
+    if canonical_mode == "chemaxon-like":
+        return chemaxon_like_smiles_from_mol(out_mol)
+    elif canonical_mode == "none":
+        return Chem.MolToSmiles(out_mol, canonical=False)
+    else:  # "rdkit"
+        return Chem.MolToSmiles(out_mol, canonical=True)
 
 
 def standardize_enhanced_smiles_to_molblock(
@@ -367,6 +397,7 @@ def standardize_any(
     assume_enhanced_smiles: bool = False,
     index_base: int = 0,
     output_format: str = "smiles",  # "smiles", "mol", "molblock"
+    canonical_mode: str = "rdkit",  # "rdkit", "chemaxon-like", "none"
 ) -> Optional[Union[str, Chem.Mol]]:
     """
     Convenience front door.
@@ -380,7 +411,12 @@ def standardize_any(
             return out_mol
         if output_format == "molblock":
             return Chem.MolToMolBlock(out_mol)
-        return Chem.MolToSmiles(out_mol)
+        if canonical_mode == "chemaxon-like":
+            return chemaxon_like_smiles_from_mol(out_mol)
+        elif canonical_mode == "none":
+            return Chem.MolToSmiles(out_mol, canonical=False)
+        else:  # "rdkit"
+            return Chem.MolToSmiles(out_mol, canonical=True)
 
     # 2) String input
     s = x.strip()
@@ -399,7 +435,12 @@ def standardize_any(
             return out_mol
         if output_format == "molblock":
             return Chem.MolToMolBlock(out_mol)
-        return Chem.MolToSmiles(out_mol)
+        if canonical_mode == "chemaxon-like":
+            return chemaxon_like_smiles_from_mol(out_mol)
+        elif canonical_mode == "none":
+            return Chem.MolToSmiles(out_mol, canonical=False)
+        else:  # "rdkit"
+            return Chem.MolToSmiles(out_mol, canonical=True)
 
     # 3) SMILES / enhanced SMILES
     is_enhanced = assume_enhanced_smiles or ("{" in s and "}" in s)
@@ -436,12 +477,22 @@ def standardize_any(
         return None
 
     if output_format == "smiles":
-        return Chem.MolToSmiles(out_mol)
+        if canonical_mode == "chemaxon-like":
+            return chemaxon_like_smiles_from_mol(out_mol)
+        elif canonical_mode == "none":
+            return Chem.MolToSmiles(out_mol, canonical=False)
+        else:  # "rdkit"
+            return Chem.MolToSmiles(out_mol, canonical=True)
     if output_format == "mol":
         return out_mol
     if output_format == "molblock":
         return Chem.MolToMolBlock(out_mol)
-    return Chem.MolToSmiles(out_mol)
+    if canonical_mode == "chemaxon-like":
+        return chemaxon_like_smiles_from_mol(out_mol)
+    elif canonical_mode == "none":
+        return Chem.MolToSmiles(out_mol, canonical=False)
+    else:  # "rdkit"
+        return Chem.MolToSmiles(out_mol, canonical=True)
 
 
 def standardize_mol_to_enhanced_smiles(

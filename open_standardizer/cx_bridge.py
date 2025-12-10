@@ -1,14 +1,16 @@
 # open_standardizer/cx_bridge.py
 from __future__ import annotations
+import sys
 
 from typing import Optional, Tuple
-
 from rdkit import Chem
 
 try:
     # RDKit’s CXSMILES writer; exact location can vary a bit by version
     from rdkit.Chem.rdmolfiles import MolToCXSmiles  # type: ignore[attr-defined]
 except ImportError:
+    sys.stderr.write("\nrdkit.Chem.MolToCXSmiles was not available in Rdkit\n")
+    sys.stderr.flush()
     MolToCXSmiles = None  # fall back gracefully
 
 
