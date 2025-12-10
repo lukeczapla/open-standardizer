@@ -118,6 +118,8 @@ def parse_chemaxon_enhanced(smiles: str) -> ChemAxonEnhanced:
         return ChemAxonEnhanced(core_smiles="", meta=None)
 
     s = smiles.strip()
+    if "[X]" in s:
+        s = s.replace("[X]", "[*]")
     if not s.endswith("}"):
         return ChemAxonEnhanced(core_smiles=s, meta=None)
 

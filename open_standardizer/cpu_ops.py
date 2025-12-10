@@ -1,21 +1,44 @@
-from rdkit import Chem
+from typing import Tuple
+from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem, rdmolops, rdchem
 from rdkit.Chem.MolStandardize import rdMolStandardize
 from rdkit.Chem.MolStandardize.rdMolStandardize import TautomerEnumerator, CleanupParameters
 from .enhanced_smiles import enhanced_smiles_to_mol
 
-#from rdkit import RDLogger
-
-#RDLogger.DisableLog("rdApp.warning")
-
 _STRIPPER_DEFAULT_KEEP_LAST = rdMolStandardize.FragmentRemover()
 
 # ---- Tautomer enumerator with higher limits ----
 _TAUTOMER_PARAMS = CleanupParameters()
-_TAUTOMER_PARAMS.maxTransforms = 5000
-_TAUTOMER_PARAMS.maxTautomers = 2000
+_TAUTOMER_PARAMS.maxTautomers = 96
+_TAUTOMER_PARAMS.maxTransforms = 256
 
 _TAUTOMER_ENUMERATOR = TautomerEnumerator(_TAUTOMER_PARAMS)
+_UNCHARGER = rdMolStandardize.Uncharger()
+
+
+def _safe_sanitize(mol: Chem.Mol) -> Tuple[Chem.Mol, bool]:
+    """
+    Best-effort sanitize:
+
+    1) Try full Chem.SanitizeMol (including kekulization).
+    2) If that fails, retry without SANITIZE_KEKULIZE.
+    3) Return (mol, True) if either succeeds, (mol, False) if both fail.
+
+    RDKit logs are silenced during the attempts.
+    """
+    # First: full sanitize (with kekulization)
+    try:
+        Chem.SanitizeMol(mol)
+        return mol, True
+    except Exception:
+        # Second: sanitize without kekulization
+        flags = Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_KEKULIZE
+        try:
+            Chem.SanitizeMol(mol, sanitizeOps=flags)
+            return mol, True
+        except Exception:
+            # both attempts failed
+            return mol, False
 
 
 def _ensure_mol(mol):
@@ -26,6 +49,13 @@ def _ensure_mol(mol):
     if isinstance(mol, Chem.Mol):
         return Chem.Mol(mol)
     if isinstance(mol, str):
+        s = mol.strip()
+        if not s:
+            return None
+        # Map ChemAxon placeholder [X] → RDKit dummy [*]
+        # (so [X]OC(=O)C1CCCCC1O becomes [*]OC(=O)C1CCCCC1O)
+        if "[X]" in s:
+            s = s.replace("[X]", "[*]")
         return Chem.MolFromSmiles(mol)
     return None
 
@@ -67,10 +97,8 @@ def op_remove_fragment_keeplargest(mol):
     if not frags:
         return mol
     largest = max(frags, key=lambda m: m.GetNumHeavyAtoms())
-    try:
-        Chem.SanitizeMol(largest)
-    except Exception:
-        # If sanitize fails, just return the original molecule
+    largest, ok = _safe_sanitize(largest)
+    if not ok:
         return mol
     return largest
 
@@ -120,32 +148,62 @@ def op_clear_isotopes(mol):
 
 
 # ---------- 7. NEUTRALIZE ----------
+
 def _neutralize(mol):
-    mol = _ensure_mol(mol)
-    if mol is None:
-        return None
+    """
+    ChemAxon-like neutralization:
+
+    - First use RDKit's Uncharger for safe charge-pair neutralizations
+    - Then apply ChemAxon-style SMARTS rules
+    - If a rule would produce an invalid valence (e.g. neutral 4-valent N),
+      we roll back just that rule and keep the previous molecule.
+    """
+    # work on a copy
+    current = Chem.Mol(mol)
+
+    # 1) RDKit uncharger (safe stuff: simple salts, zwitterions, etc.)
+    try:
+        current = _UNCHARGER.uncharge(current)
+    except Exception:
+        current = Chem.Mol(current)
+
     patterns = (
-        ("[n+;H]", "n"),
-        ("[N+;!H0]", "N"),
-        ("[$([O-]);!$([O-][#7])]", "O"),
-        ("[S-]", "S"),
-        ("[$([N-]);!$([N-][#6]);!$([N-][#7])]", "N"),
+        ('[n+;H]', 'n'),
+        ('[N+;!H0]', 'N'),
+        ('[$([O-]);!$([O-][#7])]', 'O'),
+        ('[S-]', 'S'),
+        ('[$([N-]);!$([N-][#6]);!$([N-][#7])]', 'N'),
     )
-    replaced = False
 
     for smarts, repl in patterns:
+        patt = Chem.MolFromSmarts(smarts)
+        if patt is None:
+            continue
+
+        work = Chem.Mol(current)
+        changed = False
+
         while True:
-            matches = mol.GetSubstructMatches(Chem.MolFromSmarts(smarts))
+            matches = work.GetSubstructMatches(patt)
             if not matches:
                 break
-            replaced = True
-            for atom_idx in matches:
-                atom = mol.GetAtomWithIdx(atom_idx[0])
+
+            changed = True
+            for idx_tuple in matches:
+                atom = work.GetAtomWithIdx(idx_tuple[0])
                 atom.SetFormalCharge(0)
 
-    if replaced:
-        Chem.SanitizeMol(mol)
-    return mol
+            # if this pattern application breaks valence, roll back
+            work, ok = _safe_sanitize(work)
+            if not ok:
+                work = None
+                break
+
+        if work is not None and changed:
+            # pattern worked without breaking valence → commit it
+            current = work
+
+    return current
 
 
 def op_neutralize(mol):
@@ -167,15 +225,14 @@ def op_mesomerize(mol):
     if mol is None:
         return None
     try:
-        res = rdchem.ResonanceMolSupplier(mol, rdchem.UNCONSTRAINED_ANIONS)
+        res = rdchem.ResonanceMolSupplier(mol, rdchem.UNCONSTRAINED_RESONANCE)
     except Exception:
         return mol
 
     if len(res) > 0:
         best = Chem.Mol(res[0])
-        try:
-            Chem.SanitizeMol(best)
-        except Exception:
+        best, ok = _safe_sanitize(mol)
+        if not ok:
             return mol
         return best
     return mol
@@ -241,7 +298,9 @@ def op_remove_fragment_smallest(mol):
     for f in kept[1:]:
         combo = rdmolops.CombineMols(combo, f)
 
-    Chem.SanitizeMol(combo)
+    combo, ok = _safe_sanitize(combo)
+    if not ok:
+        return mol
     return combo
 
 

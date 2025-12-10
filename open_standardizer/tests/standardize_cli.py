@@ -44,9 +44,12 @@ from __future__ import annotations
 import argparse
 import csv
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from typing import Iterable, Optional, Tuple, List
 
-from rdkit import Chem  # kept in case you want to extend later
+from rdkit import RDLogger
+RDLogger.DisableLog("rdApp.error")
+RDLogger.DisableLog("rdApp.warning")
 
 from open_standardizer.standardize import (
     standardize,
@@ -176,18 +179,9 @@ def _process_smiles(
     smiles: str,
     args: argparse.Namespace,
 ) -> Tuple[str, str]:
-    """
-    Process a single SMILES/enhanced-SMILES string.
-
-    Returns:
-        (std_smiles, status)
-        - std_smiles: possibly transformed SMILES/enhanced-SMILES or original on error
-        - status: "OK" or "ERROR"
-    """
     orig = smiles
 
     try:
-        # Decide metadata handling
         if args.drop_meta:
             preserve_meta = False
             regenerate_stereo = False
@@ -195,7 +189,6 @@ def _process_smiles(
             preserve_meta = True
             regenerate_stereo = bool(args.regenerate_stereo)
 
-        # Branch: XML-based or op-based pipeline
         if args.xml_config:
             out = _standardize_with_xml(
                 smiles=smiles,
@@ -217,7 +210,9 @@ def _process_smiles(
             return orig, "ERROR"
         return out, "OK"
 
-    except Exception as e:  # CLI defensive layer
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:
         sys.stderr.write(f"[ERROR] {e!r} while processing: {orig}\n")
         return orig, "ERROR"
 
@@ -226,7 +221,26 @@ def _process_smiles(
 # CLI
 # ---------------------------------------------------------------------------
 
-def main(argv: Optional[list[str]] = None) -> int:
+def _worker_task(args_tuple):
+    rec_id, smi, args = args_tuple
+    std_smi, status = _process_smiles(smi, args)
+    return rec_id, smi, std_smi, status
+
+
+def _update_progress(done: int, total: int):
+    """
+    Simple stderr progress: "Processed X/Y".
+    Called from the main process only.
+    """
+    if total <= 0:
+        return
+    # update every 100 molecules, and at the very end
+    if (done % 100 == 0) or (done == total):
+        sys.stderr.write(f"\rProcessed {done}/{total} molecules")
+        sys.stderr.flush()
+
+
+def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Standardize SMILES / enhanced SMILES using open_standardizer.\n"
@@ -290,26 +304,69 @@ def main(argv: Optional[list[str]] = None) -> int:
             "Useful for triage runs on large libraries."
         ),
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of parallel workers (processes). 1 = no parallelism.",
+    )
 
     args = parser.parse_args(argv)
 
     writer = csv.writer(sys.stdout)
     writer.writerow(["id", "orig_smiles", "std_smiles", "status"])
 
+    # materialize all rows so we know total for progress
+    rows = list(_iter_rows(args.input))
+    total = len(rows)
     any_error = False
 
-    for rec_id, smi in _iter_rows(args.input):
-        std_smi, status = _process_smiles(smi, args)
+    try:
+        if args.workers <= 1:
+            # single-process path
+            for i, (rec_id, smi) in enumerate(rows, start=1):
+                std_smi, status = _process_smiles(smi, args)
 
-        if args.only_errors and status == "OK":
-            continue
+                if args.only_errors and status == "OK":
+                    _update_progress(i, total)
+                    continue
 
-        orig_core = _core_smiles(smi)
-        std_core = _core_smiles(std_smi)
+                orig_core = _core_smiles(smi)
+                std_core = _core_smiles(std_smi)
+                writer.writerow([rec_id, orig_core, std_core, status])
+                if status != "OK":
+                    any_error = True
 
-        writer.writerow([rec_id, orig_core, std_core, status])
-        if status != "OK":
-            any_error = True
+                _update_progress(i, total)
+        else:
+            # multi-process path
+            items = [(rec_id, smi, args) for (rec_id, smi) in rows]
+
+            with ProcessPoolExecutor(max_workers=args.workers) as ex:
+                # map preserves order; we just wrap the iterator with an index
+                for i, (rec_id, smi, std_smi, status) in enumerate(
+                    ex.map(_worker_task, items), start=1
+                ):
+                    if args.only_errors and status == "OK":
+                        _update_progress(i, total)
+                        continue
+                    orig_core = _core_smiles(smi)
+                    std_core = _core_smiles(std_smi)
+
+                    writer.writerow([rec_id, orig_core, std_core, status])
+                    if status != "OK":
+                        any_error = True
+
+                    _update_progress(i, total)
+
+    except KeyboardInterrupt:
+        sys.stderr.write("\n[INFO] Interrupted by user (Ctrl+C)\n")
+        sys.stderr.flush()
+        return 130
+    finally:
+        if total > 0:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
 
     return 1 if any_error else 0
 
